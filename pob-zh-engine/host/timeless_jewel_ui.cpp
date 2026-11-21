@@ -76,12 +76,19 @@ std::string url_encode(const std::string& s)
 
 } // namespace
 
-// trade realms: every conqueror the calculator offers exists on both regions with the same id (--tj-realm-check re-proves it).
+// trade realms: every conqueror the calculator offers exists on every region the table lists,
+// with the same id (--tj-realm-check re-proves it).
 const TradeRealm kTradeRealms[] = {
 	// NOTE: the .tw site answers on the bare host; www.pathofexile.tw 301s to it,
 	// so use the canonical one and save a redirect.
 	{ u8"國際服", "www.pathofexile.com", L"www.pathofexile.com", true },
 	{ u8"台服",   "pathofexile.tw",      L"pathofexile.tw",      false },
+	// NOTE: the Tencent realm also answers on the bare host, and it keeps the league
+	// ids in Chinese (S31赛季 / S31赛季（专家） / 永久 ...). The list comes from that
+	// host's own /api/trade/data/leagues and the id is percent-encoded byte-wise just
+	// like the .tw leagues, so nothing else in the URL builder has to change.
+	// It has no console platforms: the realm segment is always dropped.
+	{ u8"國服",   "poe.game.qq.com",     L"poe.game.qq.com",     false },
 };
 const int kTradeRealmCount = (int)(sizeof(kTradeRealms) / sizeof(kTradeRealms[0]));
 
@@ -1059,9 +1066,13 @@ public:
 		section(u8"區域");
 		indent();
 		{
-			const char* realms[2] = { kTradeRealms[0].label, kTradeRealmCount > 1 ? kTradeRealms[1].label : "" };
+			// One segment per region in the table (Segmented takes a count), so adding a
+			// realm needs no edit here.
+			const int realmN = (int)(sizeof(kTradeRealms) / sizeof(kTradeRealms[0]));
+			const char* realms[sizeof(kTradeRealms) / sizeof(kTradeRealms[0])] = {};
+			for (int r = 0; r < realmN; r++) realms[r] = kTradeRealms[r].label;
 			int sel = tradeRealm;
-			if (PobUi::Segmented("##realm", &sel, realms, (std::min)(kTradeRealmCount, 2)) && sel != tradeRealm) {
+			if (PobUi::Segmented("##realm", &sel, realms, realmN) && sel != tradeRealm) {
 				tradeRealm = sel;
 				// League names are region-specific, so the current pick and the
 				// cached list are both meaningless now: refetch and re-default.

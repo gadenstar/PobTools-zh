@@ -1640,6 +1640,15 @@ int RunTimelessJewelSelfTest(const std::wstring& exeDir)
 		check(TradeSearchUrl(1, "Standard", 0, q1).find("www.pathofexile.tw") == std::string::npos,
 		      "taiwan never uses the redirecting www host");
 
+		// China (Tencent): canonical host, CJK league percent-encoded per byte, and
+		// never a console segment either. Index 2 = the realm appended after .tw.
+		std::string cn = TradeSearchUrl(2, u8"S31赛季", 0, q1);
+		check(cn == "https://poe.game.qq.com/trade/search/S31%E8%B5%9B%E5%AD%A3?q=" + kQ,
+		      "china url: canonical host + encoded CJK league", cn.substr(0, 60));
+		check(TradeSearchUrl(2, u8"S31赛季", 1, q1) == cn &&
+		      TradeSearchUrl(2, u8"S31赛季", 2, q1) == cn,
+		      "china ignores the console platform entirely");
+
 		// guards
 		check(TradeSearchUrl(0, "", 0, q1).empty(), "empty league yields no url");
 		check(TradeSearchUrl(0, "Standard", 0, "").empty(), "empty query yields no url");
