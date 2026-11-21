@@ -1,6 +1,12 @@
-# 说明：上游把 workflow 放在 pob-zh-engine/.github/workflows/ 子目录里，GitHub Actions 不认子目录，
-# 所以 fork 里必须把它放到仓库根的 .github/workflows/，并把 source-dir 指到 pob-zh-engine。
-# 这个文件的目的是在 fork 上产出带「国服」区域的 pob-zh.exe。
+# 目的：在 fork 上产出带「國服」区域的 pob-zh.exe。
+# 与上游 workflow 的差异：
+#   1) 放在仓库根 .github/workflows/（子目录里的 workflow 不会被执行）；
+#   2) source-dir 指到 pob-zh-engine；
+#   3) 不用 lukka/run-vcpkg 和 threeal/cmake-action，改为直接跑 vcpkg / cmake CLI：
+#      - 把 vcpkg 固定在 vcpkg-configuration.json 的 baseline 提交，
+#        因为 triplet x64-windows-release 只在该 commit 的 triplets/community/ 下存在；
+#      - 出错时日志直接可读，不再只剩 "error code 1"；
+#   4) 额外归档 pob-zh.exe（上游只归档 SimpleGraphic.dll）。
 
 name: Build pob-zh (CN realm)
 
@@ -15,12 +21,18 @@ concurrency:
   group: build-pob-zh-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 120
     env:
-      VCPKG_DEFAULT_TRIPLET: x64-windows-release
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_TARGET_TRIPLET: x64-windows-release
+      VCPKG_DEFAULT_TRIPLET: x64-windows-release
       VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
       INST_DIR: ${{ github.workspace }}/install-prefix
     steps:
@@ -29,37 +41,47 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Append short commit sha to CFG_VERSION_NUM
-        shell: powershell
+      - name: Stamp short sha into config.h
         run: |
-          $file = 'pob-zh-engine\config.h'
+          $file = 'pob-zh-engine/config.h'
           $short = (git rev-parse --short HEAD)
           (Get-Content $file -Raw) -replace '(#define\s+CFG_VERSION_NUM\s+"[^"]*)(")', "`$1-$short`$2" | Set-Content $file -Encoding utf8
 
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgJsonGlob: "./pob-zh-engine/vcpkg.json"
-          runVcpkgInstall: true
+      - name: Clone vcpkg at the manifest baseline
+        run: |
+          $cfg = Get-Content 'pob-zh-engine/vcpkg-configuration.json' -Raw | ConvertFrom-Json
+          $baseline = $cfg.'default-registry'.baseline
+          Write-Host "vcpkg baseline = $baseline"
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          git -C "$env:VCPKG_ROOT" checkout $baseline
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:VCPKG_ROOT/vcpkg.exe" version
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - name: Verify the release triplet exists at this vcpkg commit
+        run: |
+          $t = Join-Path $env:VCPKG_ROOT 'triplets/community/x64-windows-release.cmake'
+          if (-not (Test-Path $t)) {
+            Write-Host "::error::x64-windows-release triplet missing at this vcpkg commit"
+            Get-ChildItem (Join-Path $env:VCPKG_ROOT 'triplets/community') -Name | Select-Object -First 40
+            exit 1
+          }
+          Write-Host "triplet OK: $t"
 
-      - name: Obtain and run CMake
-        uses: threeal/cmake-action@v1.3.0
-        with:
-          source-dir: "pob-zh-engine"
-          build-dir: "build"
-          generator: "Visual Studio 17 2022"
-          options: CMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" CMAKE_INSTALL_PREFIX="${{ env.INST_DIR }}" VCPKG_TARGET_TRIPLET="${{ env.VCPKG_TARGET_TRIPLET }}"
+      - name: Configure
+        run: |
+          cmake -S pob-zh-engine -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TARGET_TRIPLET" `
+            -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALLED_DIR" `
+            -DCMAKE_INSTALL_PREFIX="$env:INST_DIR"
 
       - name: Build and install
         run: cmake --build build --config Release -t INSTALL
 
       - name: Show install output
-        shell: powershell
         run: |
-          Get-ChildItem "$env:INST_DIR" -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
+          Get-ChildItem "$env:INST_DIR" -Filter 'pob-zh*' -File | Select-Object Name, Length | Format-Table -AutoSize
+          Get-ChildItem "$env:INST_DIR" -Filter '*.dll' -File | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Upload pob-zh exe and engine DLLs
         uses: actions/upload-artifact@v4
