@@ -2,11 +2,13 @@
 # 与上游 workflow 的差异：
 #   1) 放在仓库根 .github/workflows/（子目录里的 workflow 不会被执行）；
 #   2) source-dir 指到 pob-zh-engine；
-#   3) 不用 lukka/run-vcpkg 和 threeal/cmake-action，改为直接跑 vcpkg / cmake CLI：
-#      - 把 vcpkg 固定在 vcpkg-configuration.json 的 baseline 提交，
-#        因为 triplet x64-windows-release 只在该 commit 的 triplets/community/ 下存在；
-#      - 出错时日志直接可读，不再只剩 "error code 1"；
-#   4) 额外归档 pob-zh.exe（上游只归档 SimpleGraphic.dll）。
+#   3) vcpkg 固定在 vcpkg-configuration.json 的 baseline 提交（triplet x64-windows-release 只在那里）；
+#   4) 先把 pkgconf 装成外部程序：baseline 版 vcpkg 的 vcpkg_acquire_msys 里写死的 MSYS2
+#      包名（mingw-w64-x86_64-pkgconf-1~2.2.0-1-any.pkg.tar.zst）在 MSYS2 上已经 404，
+#      而 vcpkg 找到外部 pkgconf 就不会再去下 MSYS2 包；overlay 端口只需要 pkgconf 这一样；
+#   5) 生成器改用 Ninja：runner 现在是 VS 18，"Visual Studio 17 2022" 不存在了；
+#      Ninja 是单配置，所以要显式 -DCMAKE_BUILD_TYPE=Release，安装目标是 install；
+#   6) 额外归档 pob-zh.exe（上游只归档 SimpleGraphic.dll）。
 
 name: Build pob-zh (CN realm)
 
@@ -60,23 +62,30 @@ jobs:
       - name: Verify the release triplet exists at this vcpkg commit
         run: |
           $t = Join-Path $env:VCPKG_ROOT 'triplets/community/x64-windows-release.cmake'
-          if (-not (Test-Path $t)) {
-            Write-Host "::error::x64-windows-release triplet missing at this vcpkg commit"
-            Get-ChildItem (Join-Path $env:VCPKG_ROOT 'triplets/community') -Name | Select-Object -First 40
-            exit 1
-          }
+          if (-not (Test-Path $t)) { Write-Host "::error::x64-windows-release triplet missing at this vcpkg commit"; exit 1 }
+          Get-Content $t
           Write-Host "triplet OK: $t"
 
-      - name: Configure
+      - name: Provide pkgconf so vcpkg does not fetch MSYS2 packages
         run: |
-          cmake -S pob-zh-engine -B build -G "Visual Studio 17 2022" -A x64 `
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+            choco install pkgconfiglite -y --no-progress
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          }
+          pkg-config --version
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) { Write-Host "::error::pkg-config still missing"; exit 1 }
+
+      - name: Configure (Ninja, Release)
+        run: |
+          cmake -S pob-zh-engine -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TARGET_TRIPLET" `
             -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALLED_DIR" `
             -DCMAKE_INSTALL_PREFIX="$env:INST_DIR"
 
       - name: Build and install
-        run: cmake --build build --config Release -t INSTALL
+        run: cmake --build build --target install
 
       - name: Show install output
         run: |
