@@ -1,14 +1,15 @@
-# 目的：在 fork 上产出带「國服」区域的 pob-zh.exe。
+# 在 fork 上产出带「國服」区域的 pob-zh.exe。
 # 与上游 workflow 的差异：
-#   1) 放在仓库根 .github/workflows/（子目录里的 workflow 不会被执行）；
+#   1) 放在仓库根 .github/workflows/（pob-zh-engine/.github 里的 workflow 不会被执行）；
 #   2) source-dir 指到 pob-zh-engine；
 #   3) vcpkg 固定在 vcpkg-configuration.json 的 baseline 提交（triplet x64-windows-release 只在那里）；
-#   4) 先把 pkgconf 装成外部程序：baseline 版 vcpkg 的 vcpkg_acquire_msys 里写死的 MSYS2
-#      包名（mingw-w64-x86_64-pkgconf-1~2.2.0-1-any.pkg.tar.zst）在 MSYS2 上已经 404，
-#      而 vcpkg 找到外部 pkgconf 就不会再去下 MSYS2 包；overlay 端口只需要 pkgconf 这一样；
-#   5) 生成器改用 Ninja：runner 现在是 VS 18，"Visual Studio 17 2022" 不存在了；
-#      Ninja 是单配置，所以要显式 -DCMAKE_BUILD_TYPE=Release，安装目标是 install；
-#   6) 额外归档 pob-zh.exe（上游只归档 SimpleGraphic.dll）。
+#   4) 用 PKG_CONFIG 环境变量把外部 pkg-config 交给 vcpkg：baseline 版 vcpkg 的
+#      scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake 第 64 行判断 ENV{PKG_CONFIG}，
+#      命中就立刻 return，不再去下 MSYS2 包（那批包名已 404，MSYS2 只保留当前构建）；
+#      overlay 端口只需要 pkgconf 这一个外部工具，且只用到 --print-errors --exists；
+#   5) 生成器不写死：runner 现在是 VS 18，写死 "Visual Studio 17 2022" 会找不到实例，
+#      改为从 cmake --help 的生成器列表里按 vswhere 得到的主版本号挑选，并沿用多配置构建（--config Release --target INSTALL）；
+#   6) 归档 pob-zh.exe + 引擎 DLL。
 
 name: Build pob-zh (CN realm)
 
@@ -30,7 +31,7 @@ defaults:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_TARGET_TRIPLET: x64-windows-release
@@ -42,6 +43,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Cache vcpkg downloads and installed packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg_installed
+            vcpkg/downloads
+          key: vcpkg-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('pob-zh-engine/vcpkg.json', 'pob-zh-engine/vcpkg-configuration.json') }}
 
       - name: Stamp short sha into config.h
         run: |
@@ -66,31 +75,55 @@ jobs:
           Get-Content $t
           Write-Host "triplet OK: $t"
 
-      - name: Provide pkgconf so vcpkg does not fetch MSYS2 packages
+      - name: Provide pkg-config via PKG_CONFIG (skips MSYS2 downloads)
         run: |
           if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
             choco install pkgconfiglite -y --no-progress
-            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+            $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
           }
-          pkg-config --version
-          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) { Write-Host "::error::pkg-config still missing"; exit 1 }
+          $exe = (Get-Command pkg-config -ErrorAction SilentlyContinue).Source
+          if (-not $exe -or -not (Test-Path $exe)) { Write-Host "::error::pkg-config not available"; exit 1 }
+          if ($exe -match ' ') { Write-Host "::error::pkg-config path contains spaces: $exe"; exit 1 }
+          Write-Host "pkg-config -> $exe"
+          & $exe --version
+          "PKG_CONFIG=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "exported PKG_CONFIG=$exe"
 
-      - name: Configure (Ninja, Release)
+      - name: Detect a Visual Studio generator that exists on this runner
         run: |
-          cmake -S pob-zh-engine -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
+          $help = (cmake --help) -join "`n"
+          $gens = [regex]::Matches($help, 'Visual Studio \d+ \d{4}') | ForEach-Object { $_.Value } | Sort-Object -Unique
+          Write-Host "CMake lists generators: $($gens -join ' | ')"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { Write-Host "::error::vswhere not found"; exit 1 }
+          $ver = ((& $vswhere -latest -products * -property installationVersion) -join '').Trim()
+          Write-Host "vswhere installationVersion = $ver"
+          $major = ($ver -split '\.')[0]
+          $gen = $gens | Where-Object { $_ -match "^Visual Studio $major " } | Select-Object -First 1
+          if (-not $gen) { Write-Host "::error::no CMake generator matches Visual Studio major version $major"; exit 1 }
+          Write-Host "Selected generator: $gen"
+          "GEN=$gen" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure and install dependencies (vcpkg runs here)
+        run: |
+          cmake -S pob-zh-engine -B build -G "$env:GEN" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TARGET_TRIPLET" `
             -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALLED_DIR" `
             -DCMAKE_INSTALL_PREFIX="$env:INST_DIR"
 
       - name: Build and install
-        run: cmake --build build --target install
+        run: cmake --build build --config Release --target INSTALL
 
       - name: Show install output
         run: |
-          Get-ChildItem "$env:INST_DIR" -Filter 'pob-zh*' -File | Select-Object Name, Length | Format-Table -AutoSize
-          Get-ChildItem "$env:INST_DIR" -Filter '*.dll' -File | Select-Object Name, Length | Format-Table -AutoSize
+          if (Test-Path "$env:INST_DIR") {
+            Get-ChildItem "$env:INST_DIR" -Filter 'pob-zh*' -File | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+            Get-ChildItem "$env:INST_DIR" -Filter '*.dll' -File | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+          } else {
+            Write-Host "::error::install prefix missing: $env:INST_DIR"
+            exit 1
+          }
 
       - name: Upload pob-zh exe and engine DLLs
         uses: actions/upload-artifact@v4
